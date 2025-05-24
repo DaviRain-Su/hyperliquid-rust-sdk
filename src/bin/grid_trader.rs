@@ -1,13 +1,15 @@
 use ethers::signers::{LocalWallet, Signer};
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient, InfoClient,
-    ClientCancelRequest, ExchangeDataStatus, ExchangeResponseStatus, Message, Subscription,
+    ClientCancelRequest, ExchangeDataStatus, ExchangeResponseStatus, Message, Subscription, UserData,
 };
 use log::{error, info};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
+use dotenv::dotenv;
+use std::env;
 
 // 格式化价格到指定精度
 fn format_price(price: f64, precision: u32) -> f64 {
@@ -42,13 +44,19 @@ fn calculate_amplitude(klines: &[f64]) -> (f64, f64) {
 
 #[tokio::main]
 async fn main() {
+    // 加载 .env 文件
+    dotenv().ok();
     env_logger::init();
     
+    // 从环境变量读取私钥
+    let private_key = env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set in .env file");
+    
     // 初始化钱包
-    let wallet: LocalWallet = "YOUR_PRIVATE_KEY"
+    let wallet: LocalWallet = private_key
         .parse()
         .unwrap();
-    println!("Wallet: {:?}", wallet.address());
+    let user_address = wallet.address();
+    println!("Wallet: {:?}", user_address);
 
     // 初始化客户端
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await.unwrap();
@@ -75,12 +83,21 @@ async fn main() {
     let mut max_equity = 0.0;
     let mut initial_equity = None;
 
+    // 价格历史记录，用于计算波动率
+    let mut price_history: Vec<f64> = Vec::new();
+    let history_length = 20; // 保存最近20个价格点
+
     // 创建消息通道
     let (sender, mut receiver) = unbounded_channel();
 
-    // 订阅中间价格
+    // 订阅中间价格和用户事件
     info_client
         .subscribe(Subscription::AllMids, sender.clone())
+        .await
+        .unwrap();
+    
+    info_client
+        .subscribe(Subscription::UserEvents { user: user_address }, sender.clone())
         .await
         .unwrap();
 
@@ -94,11 +111,24 @@ async fn main() {
                 if let Some(current_price) = all_mids.get(&asset) {
                     let current_price: f64 = current_price.parse().unwrap();
                     
+                    // 更新价格历史
+                    price_history.push(current_price);
+                    if price_history.len() > history_length {
+                        price_history.remove(0);
+                    }
+                    
+                    // 计算波动率并调整网格间距
+                    let (avg_up, avg_down) = calculate_amplitude(&price_history);
+                    let volatility = (avg_up + avg_down) / 2.0;
+                    let grid_spacing = volatility.max(0.001); // 最小间距0.1%
+                    
                     // 打印价格变化
                     if let Some(last) = last_price {
                         let price_change = ((current_price - last) / last) * 100.0;
                         info!("价格变化: {:.2}% (从 {:.2} 到 {:.2})", 
                             price_change, last, current_price);
+                        info!("当前波动率: {:.4}%, 网格间距: {:.4}%", 
+                            volatility * 100.0, grid_spacing * 100.0);
                     }
                     last_price = Some(current_price);
 
@@ -165,13 +195,13 @@ async fn main() {
                     active_orders.clear();
 
                     // 计算网格价格
-                    let buy_threshold = 0.001; // 0.1% 的买入阈值
-                    let sell_threshold = 0.001; // 0.1% 的卖出阈值
+                    let buy_threshold = grid_spacing; // 使用动态网格间距
+                    let sell_threshold = grid_spacing;
 
                     // 买单网格
                     if long_position < max_position {
                         for i in 0..grid_count {
-                            let price = current_price * (1.0 - buy_threshold - i as f64 * 0.0005);
+                            let price = current_price * (1.0 - buy_threshold - i as f64 * grid_spacing);
                             let formatted_price = format_price(price, price_precision);
                             let quantity = format_price(trade_amount / formatted_price, quantity_precision);
                             
@@ -209,7 +239,7 @@ async fn main() {
                     // 卖单网格
                     if short_position < max_position {
                         for i in 0..grid_count {
-                            let price = current_price * (1.0 + sell_threshold + i as f64 * 0.0005);
+                            let price = current_price * (1.0 + sell_threshold + i as f64 * grid_spacing);
                             let formatted_price = format_price(price, price_precision);
                             let quantity = format_price(trade_amount / formatted_price, quantity_precision);
                             
@@ -251,6 +281,38 @@ async fn main() {
                     info!("最大权益: {}", max_equity);
                     info!("当前权益: {}", current_equity);
                     info!("活跃订单数量: {}", active_orders.len());
+                }
+            },
+            Some(Message::User(user_event)) => {
+                // 处理用户事件
+                match user_event.data {
+                    UserData::Fills(fills) => {
+                        for fill in fills {
+                            info!("订单成交: ID={}, 价格={}, 数量={}, 方向={}", 
+                                fill.oid, fill.px, fill.sz, if fill.side == "B" { "买入" } else { "卖出" });
+                            
+                            // 更新持仓
+                            let fill_size: f64 = fill.sz.parse().unwrap();
+                            if fill.side == "B" {
+                                long_position += fill_size;
+                            } else {
+                                short_position += fill_size;
+                            }
+                            
+                            // 从活跃订单中移除
+                            if let Some(pos) = active_orders.iter().position(|&x| x == fill.oid) {
+                                active_orders.remove(pos);
+                            }
+                            
+                            // 从价格记录中移除
+                            if fill.side == "B" {
+                                buy_entry_prices.remove(&fill.oid);
+                            } else {
+                                sell_entry_prices.remove(&fill.oid);
+                            }
+                        }
+                    },
+                    _ => continue,
                 }
             },
             Some(_) => continue,
