@@ -84,6 +84,7 @@ async fn main() {
     let price_precision = get_env_or_default("PRICE_PRECISION", 2);
     let quantity_precision = get_env_or_default("QUANTITY_PRECISION", 1);
     let check_interval = get_env_or_default("CHECK_INTERVAL", 5);
+    let leverage = get_env_or_default("LEVERAGE", 1) as u32; // 杠杆倍数必须是整数
     
     info!("=== 交易参数 ===");
     info!("交易资产: {}", asset);
@@ -94,7 +95,17 @@ async fn main() {
     info!("价格精度: {}", price_precision);
     info!("数量精度: {}", quantity_precision);
     info!("检查间隔: {}秒", check_interval);
-    
+    info!("杠杆倍数: {}x", leverage);
+
+    // 设置杠杆倍数
+    match exchange_client.update_leverage(leverage, &asset, false, None).await {
+        Ok(_) => info!("成功设置杠杆倍数为 {}x", leverage),
+        Err(e) => {
+            error!("设置杠杆倍数失败: {:?}", e);
+            return;
+        }
+    }
+
     let mut active_orders: Vec<u64> = Vec::new();  // 存储活跃订单
     let mut last_price: Option<f64> = None;
     
