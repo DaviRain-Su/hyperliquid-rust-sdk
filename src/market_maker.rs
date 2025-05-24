@@ -20,7 +20,7 @@ pub struct MarketMakerRestingOrder {
 
 #[derive(Debug)]
 pub struct MarketMakerInput {
-    pub asset: String,
+    pub asset: String,          
     pub target_liquidity: f64, // Amount of liquidity on both sides to target
     pub half_spread: u16,      // Half of the spread for our market making (in BPS)
     pub max_bps_diff: u16, // Max deviation before we cancel and put new orders on the book (in BPS)
