@@ -5,7 +5,7 @@ use hyperliquid_rust_sdk::{
 };
 use log::{error, info};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
 use dotenv::dotenv;
@@ -77,17 +77,29 @@ async fn main() {
 
     // 从环境变量读取交易参数，如果不存在则使用默认值
     let asset = env::var("TRADING_ASSET").unwrap_or_else(|_| "BTC".to_string());
+    let total_capital = get_env_or_default("TOTAL_CAPITAL", 1000.0); // 总资金
     let grid_count = get_env_or_default("GRID_COUNT", 3);
-    let trade_amount = get_env_or_default("TRADE_AMOUNT", 100.0);
-    let max_position = get_env_or_default("MAX_POSITION", 300.0);
+    let trade_amount = get_env_or_default("TRADE_AMOUNT", total_capital / (grid_count as f64 * 2.0)); // 每个网格的交易金额
+    let max_position = get_env_or_default("MAX_POSITION", total_capital * 0.3); // 最大持仓量
     let max_drawdown = get_env_or_default("MAX_DRAWDOWN", 0.02);
     let price_precision = get_env_or_default("PRICE_PRECISION", 2);
     let quantity_precision = get_env_or_default("QUANTITY_PRECISION", 1);
     let check_interval = get_env_or_default("CHECK_INTERVAL", 5);
-    let leverage = get_env_or_default("LEVERAGE", 1) as u32; // 杠杆倍数必须是整数
+    let leverage = get_env_or_default("LEVERAGE", 1) as u32;
+    
+    // 网格策略参数
+    let min_grid_spacing = get_env_or_default("MIN_GRID_SPACING", 0.001); // 最小网格间距 0.1%
+    let max_grid_spacing = get_env_or_default("MAX_GRID_SPACING", 0.05); // 最大网格间距 5%
+    let grid_price_offset = get_env_or_default("GRID_PRICE_OFFSET", 0.0); // 网格价格偏移量
+    
+    // 风险控制参数
+    let max_single_loss = get_env_or_default("MAX_SINGLE_LOSS", 0.01); // 单笔最大亏损 1%
+    let max_daily_loss = get_env_or_default("MAX_DAILY_LOSS", 0.05); // 每日最大亏损 5%
+    let max_holding_time = get_env_or_default("MAX_HOLDING_TIME", 24 * 60 * 60); // 最大持仓时间（秒）
     
     info!("=== 交易参数 ===");
     info!("交易资产: {}", asset);
+    info!("总资金: {}", total_capital);
     info!("网格数量: {}", grid_count);
     info!("每格交易金额: {}", trade_amount);
     info!("最大持仓: {}", max_position);
@@ -96,6 +108,12 @@ async fn main() {
     info!("数量精度: {}", quantity_precision);
     info!("检查间隔: {}秒", check_interval);
     info!("杠杆倍数: {}x", leverage);
+    info!("最小网格间距: {}%", min_grid_spacing * 100.0);
+    info!("最大网格间距: {}%", max_grid_spacing * 100.0);
+    info!("网格价格偏移: {}%", grid_price_offset * 100.0);
+    info!("单笔最大亏损: {}%", max_single_loss * 100.0);
+    info!("每日最大亏损: {}%", max_daily_loss * 100.0);
+    info!("最大持仓时间: {}小时", max_holding_time / 3600);
 
     // 设置杠杆倍数
     match exchange_client.update_leverage(leverage, &asset, false, None).await {
@@ -106,7 +124,7 @@ async fn main() {
         }
     }
 
-    let mut active_orders: Vec<u64> = Vec::new();  // 存储活跃订单
+    let mut active_orders: Vec<u64> = Vec::new();
     let mut last_price: Option<f64> = None;
     
     // 持仓管理
@@ -116,10 +134,13 @@ async fn main() {
     let mut sell_entry_prices: HashMap<u64, f64> = HashMap::new();
     let mut max_equity = 0.0;
     let mut initial_equity = None;
+    let mut daily_pnl = 0.0;
+    let mut last_daily_reset = SystemTime::now();
+    let mut position_start_time: Option<SystemTime> = None;
 
-    // 价格历史记录，用于计算波动率
+    // 价格历史记录
     let mut price_history: Vec<f64> = Vec::new();
-    let history_length = get_env_or_default("HISTORY_LENGTH", 20); // 保存最近的价格点数量
+    let history_length = get_env_or_default("HISTORY_LENGTH", 20);
 
     // 创建消息通道
     let (sender, mut receiver) = unbounded_channel();
@@ -138,6 +159,14 @@ async fn main() {
     loop {
         info!("=== 开始新一轮检查 ===");
 
+        // 检查是否需要重置每日统计
+        let now = SystemTime::now();
+        if now.duration_since(last_daily_reset).unwrap().as_secs() >= 24 * 60 * 60 {
+            daily_pnl = 0.0;
+            last_daily_reset = now;
+            info!("重置每日统计");
+        }
+
         // 获取当前价格
         match receiver.recv().await {
             Some(Message::AllMids(all_mids)) => {
@@ -154,7 +183,7 @@ async fn main() {
                     // 计算波动率并调整网格间距
                     let (avg_up, avg_down) = calculate_amplitude(&price_history);
                     let volatility = (avg_up + avg_down) / 2.0;
-                    let grid_spacing = volatility.max(0.001); // 最小间距0.1%
+                    let grid_spacing = volatility.max(min_grid_spacing).min(max_grid_spacing);
                     
                     // 打印价格变化
                     if let Some(last) = last_price {
@@ -166,15 +195,57 @@ async fn main() {
                     }
                     last_price = Some(current_price);
 
-                    // 更新最大权益
+                    // 更新最大权益和当前权益
                     let current_equity = long_position - short_position;
                     if current_equity > max_equity {
                         max_equity = current_equity;
                     }
 
+                    // 检查持仓时间
+                    if let Some(start_time) = position_start_time {
+                        if now.duration_since(start_time).unwrap().as_secs() >= max_holding_time {
+                            info!("触发最大持仓时间限制，执行清仓");
+                            // 清仓逻辑
+                            if long_position > 0.0 {
+                                let order = ClientOrderRequest {
+                                    asset: asset.clone(),
+                                    is_buy: false,
+                                    reduce_only: true,
+                                    limit_px: current_price,
+                                    sz: long_position,
+                                    cloid: None,
+                                    order_type: ClientOrder::Limit(ClientLimit {
+                                        tif: "Gtc".to_string(),
+                                    }),
+                                };
+                                if let Err(e) = exchange_client.order(order, None).await {
+                                    error!("清仓失败: {:?}", e);
+                                }
+                            }
+                            if short_position > 0.0 {
+                                let order = ClientOrderRequest {
+                                    asset: asset.clone(),
+                                    is_buy: true,
+                                    reduce_only: true,
+                                    limit_px: current_price,
+                                    sz: short_position,
+                                    cloid: None,
+                                    order_type: ClientOrder::Limit(ClientLimit {
+                                        tif: "Gtc".to_string(),
+                                    }),
+                                };
+                                if let Err(e) = exchange_client.order(order, None).await {
+                                    error!("清仓失败: {:?}", e);
+                                }
+                            }
+                            position_start_time = None;
+                        }
+                    }
+
                     // 检查最大回撤
                     if let Some(init_equity) = initial_equity {
-                        if current_equity < init_equity * (1.0 - max_drawdown) {
+                        let drawdown = (init_equity - current_equity) / init_equity;
+                        if drawdown > max_drawdown {
                             info!("触发最大回撤保护，执行清仓");
                             // 清仓逻辑
                             if long_position > 0.0 {
@@ -215,6 +286,45 @@ async fn main() {
                         initial_equity = Some(current_equity);
                     }
 
+                    // 检查每日亏损限制
+                    if daily_pnl < -total_capital * max_daily_loss {
+                        info!("触发每日最大亏损限制，执行清仓");
+                        // 清仓逻辑
+                        if long_position > 0.0 {
+                            let order = ClientOrderRequest {
+                                asset: asset.clone(),
+                                is_buy: false,
+                                reduce_only: true,
+                                limit_px: current_price,
+                                sz: long_position,
+                                cloid: None,
+                                order_type: ClientOrder::Limit(ClientLimit {
+                                    tif: "Gtc".to_string(),
+                                }),
+                            };
+                            if let Err(e) = exchange_client.order(order, None).await {
+                                error!("清仓失败: {:?}", e);
+                            }
+                        }
+                        if short_position > 0.0 {
+                            let order = ClientOrderRequest {
+                                asset: asset.clone(),
+                                is_buy: true,
+                                reduce_only: true,
+                                limit_px: current_price,
+                                sz: short_position,
+                                cloid: None,
+                                order_type: ClientOrder::Limit(ClientLimit {
+                                    tif: "Gtc".to_string(),
+                                }),
+                            };
+                            if let Err(e) = exchange_client.order(order, None).await {
+                                error!("清仓失败: {:?}", e);
+                            }
+                        }
+                        return;
+                    }
+
                     // 取消所有现有订单
                     for order_id in &active_orders {
                         info!("取消订单: {}", order_id);
@@ -229,8 +339,8 @@ async fn main() {
                     active_orders.clear();
 
                     // 计算网格价格
-                    let buy_threshold = grid_spacing; // 使用动态网格间距
-                    let sell_threshold = grid_spacing;
+                    let buy_threshold = grid_spacing + grid_price_offset;
+                    let sell_threshold = grid_spacing - grid_price_offset;
 
                     // 买单网格
                     if long_position < max_position {
@@ -314,6 +424,7 @@ async fn main() {
                     info!("空头持仓: {}", short_position);
                     info!("最大权益: {}", max_equity);
                     info!("当前权益: {}", current_equity);
+                    info!("每日盈亏: {}", daily_pnl);
                     info!("活跃订单数量: {}", active_orders.len());
                 }
             },
@@ -327,10 +438,76 @@ async fn main() {
                             
                             // 更新持仓
                             let fill_size: f64 = fill.sz.parse().unwrap();
+                            let fill_price: f64 = fill.px.parse().unwrap();
+                            
+                            // 计算盈亏
+                            let pnl = if fill.side == "B" {
+                                // 买入订单的盈亏
+                                if let Some(entry_price) = sell_entry_prices.get(&fill.oid) {
+                                    (entry_price - fill_price) * fill_size
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                // 卖出订单的盈亏
+                                if let Some(entry_price) = buy_entry_prices.get(&fill.oid) {
+                                    (fill_price - entry_price) * fill_size
+                                } else {
+                                    0.0
+                                }
+                            };
+                            
+                            // 更新每日盈亏
+                            daily_pnl += pnl;
+                            
+                            // 检查单笔亏损限制
+                            if pnl < -total_capital * max_single_loss {
+                                info!("触发单笔最大亏损限制，执行清仓");
+                                // 清仓逻辑
+                                if long_position > 0.0 {
+                                    let order = ClientOrderRequest {
+                                        asset: asset.clone(),
+                                        is_buy: false,
+                                        reduce_only: true,
+                                        limit_px: fill_price,
+                                        sz: long_position,
+                                        cloid: None,
+                                        order_type: ClientOrder::Limit(ClientLimit {
+                                            tif: "Gtc".to_string(),
+                                        }),
+                                    };
+                                    if let Err(e) = exchange_client.order(order, None).await {
+                                        error!("清仓失败: {:?}", e);
+                                    }
+                                }
+                                if short_position > 0.0 {
+                                    let order = ClientOrderRequest {
+                                        asset: asset.clone(),
+                                        is_buy: true,
+                                        reduce_only: true,
+                                        limit_px: fill_price,
+                                        sz: short_position,
+                                        cloid: None,
+                                        order_type: ClientOrder::Limit(ClientLimit {
+                                            tif: "Gtc".to_string(),
+                                        }),
+                                    };
+                                    if let Err(e) = exchange_client.order(order, None).await {
+                                        error!("清仓失败: {:?}", e);
+                                    }
+                                }
+                                return;
+                            }
+                            
                             if fill.side == "B" {
                                 long_position += fill_size;
                             } else {
                                 short_position += fill_size;
+                            }
+                            
+                            // 更新持仓开始时间
+                            if position_start_time.is_none() && (long_position > 0.0 || short_position > 0.0) {
+                                position_start_time = Some(SystemTime::now());
                             }
                             
                             // 从活跃订单中移除
