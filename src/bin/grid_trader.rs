@@ -17,6 +17,17 @@ fn format_price(price: f64, precision: u32) -> f64 {
     (price * multiplier).round() / multiplier
 }
 
+// 从环境变量读取配置，如果不存在则使用默认值
+fn get_env_or_default<T: std::str::FromStr>(key: &str, default: T) -> T 
+where 
+    T::Err: std::fmt::Debug 
+{
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 // 计算K线振幅
 fn calculate_amplitude(klines: &[f64]) -> (f64, f64) {
     let mut positive_amplitudes = Vec::new();
@@ -64,16 +75,28 @@ async fn main() {
         .await
         .unwrap();
 
-    // 交易参数设置
-    let asset = "FARTCOIN".to_string();
-    let grid_count = 3;   // 网格数量
-    let trade_amount = 100.0; // 每个网格的交易金额
-    let max_position = 300.0; // 最大持仓量
-    let max_drawdown = 0.02; // 最大回撤 2%
+    // 从环境变量读取交易参数，如果不存在则使用默认值
+    let asset = env::var("TRADING_ASSET").unwrap_or_else(|_| "BTC".to_string());
+    let grid_count = get_env_or_default("GRID_COUNT", 3);
+    let trade_amount = get_env_or_default("TRADE_AMOUNT", 100.0);
+    let max_position = get_env_or_default("MAX_POSITION", 300.0);
+    let max_drawdown = get_env_or_default("MAX_DRAWDOWN", 0.02);
+    let price_precision = get_env_or_default("PRICE_PRECISION", 2);
+    let quantity_precision = get_env_or_default("QUANTITY_PRECISION", 1);
+    let check_interval = get_env_or_default("CHECK_INTERVAL", 5);
+    
+    info!("=== 交易参数 ===");
+    info!("交易资产: {}", asset);
+    info!("网格数量: {}", grid_count);
+    info!("每格交易金额: {}", trade_amount);
+    info!("最大持仓: {}", max_position);
+    info!("最大回撤: {}%", max_drawdown * 100.0);
+    info!("价格精度: {}", price_precision);
+    info!("数量精度: {}", quantity_precision);
+    info!("检查间隔: {}秒", check_interval);
+    
     let mut active_orders: Vec<u64> = Vec::new();  // 存储活跃订单
     let mut last_price: Option<f64> = None;
-    let price_precision = 2;  // 价格精度
-    let quantity_precision = 1;  // 数量精度
     
     // 持仓管理
     let mut long_position = 0.0;
@@ -85,7 +108,7 @@ async fn main() {
 
     // 价格历史记录，用于计算波动率
     let mut price_history: Vec<f64> = Vec::new();
-    let history_length = 20; // 保存最近20个价格点
+    let history_length = get_env_or_default("HISTORY_LENGTH", 20); // 保存最近的价格点数量
 
     // 创建消息通道
     let (sender, mut receiver) = unbounded_channel();
@@ -323,7 +346,7 @@ async fn main() {
         }
 
         // 等待一段时间再进行下一次检查
-        info!("\n等待5秒后进行下一次检查...");
-        sleep(Duration::from_secs(5)).await;
+        info!("\n等待{}秒后进行下一次检查...", check_interval);
+        sleep(Duration::from_secs(check_interval)).await;
     }
 } 
