@@ -2,7 +2,7 @@ use ethers::{
     signers::{LocalWallet, Signer},
     types::H160,
 };
-use log::{error, info};
+use log::{error, info, warn};
 
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -82,6 +82,7 @@ impl MarketMaker {
     }
 
     pub async fn start(&mut self) {
+        info!("Starting market maker for asset: {}", self.asset);
         let (sender, mut receiver) = unbounded_channel();
 
         // Subscribe to UserEvents for fills
@@ -94,12 +95,14 @@ impl MarketMaker {
             )
             .await
             .unwrap();
+        info!("Subscribed to user events");
 
         // Subscribe to AllMids so we can market make around the mid price
         self.info_client
             .subscribe(Subscription::AllMids, sender)
             .await
             .unwrap();
+        info!("Subscribed to mid prices");
 
         loop {
             let message = receiver.recv().await.unwrap();
@@ -109,6 +112,9 @@ impl MarketMaker {
                     let mid = all_mids.get(&self.asset);
                     if let Some(mid) = mid {
                         let mid: f64 = mid.parse().unwrap();
+                        if (mid - self.latest_mid_price).abs() > EPSILON {
+                            info!("New mid price for {}: {}", self.asset, mid);
+                        }
                         self.latest_mid_price = mid;
                         // Check to see if we need to cancel or place any new orders
                         self.potentially_update().await;
@@ -122,6 +128,7 @@ impl MarketMaker {
                 Message::User(user_events) => {
                     // We haven't seen the first mid price event yet, so just continue
                     if self.latest_mid_price < 0.0 {
+                        warn!("Waiting for first mid price update...");
                         continue;
                     }
                     let user_events = user_events.data;
@@ -132,12 +139,13 @@ impl MarketMaker {
                             if fill.side.eq("B") {
                                 self.cur_position += amount;
                                 self.lower_resting.position -= amount;
-                                info!("Fill: bought {amount} {}", self.asset.clone());
+                                info!("Fill: bought {amount} {} at price {}", self.asset.clone(), fill.px);
                             } else {
                                 self.cur_position -= amount;
                                 self.upper_resting.position -= amount;
-                                info!("Fill: sold {amount} {}", self.asset.clone());
+                                info!("Fill: sold {amount} {} at price {}", self.asset.clone(), fill.px);
                             }
+                            info!("Current position: {} {}", self.cur_position, self.asset);
                         }
                     }
                     // Check to see if we need to cancel or place any new orders
@@ -151,6 +159,7 @@ impl MarketMaker {
     }
 
     async fn attempt_cancel(&self, asset: String, oid: u64) -> bool {
+        info!("Attempting to cancel order {} for {}", oid, asset);
         let cancel = self
             .exchange_client
             .cancel(ClientCancelRequest { asset, oid }, None)
@@ -163,10 +172,11 @@ impl MarketMaker {
                         if !cancel.statuses.is_empty() {
                             match cancel.statuses[0].clone() {
                                 ExchangeDataStatus::Success => {
+                                    info!("Successfully cancelled order {}", oid);
                                     return true;
                                 }
                                 ExchangeDataStatus::Error(e) => {
-                                    error!("Error with cancelling: {e}")
+                                    error!("Error with cancelling order {}: {}", oid, e)
                                 }
                                 _ => unreachable!(),
                             }
@@ -177,9 +187,9 @@ impl MarketMaker {
                         error!("Exchange response data is empty when cancelling: {cancel:?}")
                     }
                 }
-                ExchangeResponseStatus::Err(e) => error!("Error with cancelling: {e}"),
+                ExchangeResponseStatus::Err(e) => error!("Error with cancelling: {}", e),
             },
-            Err(e) => error!("Error with cancelling: {e}"),
+            Err(e) => error!("Error with cancelling: {}", e),
         }
         false
     }
@@ -191,11 +201,14 @@ impl MarketMaker {
         price: f64,
         is_buy: bool,
     ) -> (f64, u64) {
+        let side = if is_buy { "BUY" } else { "SELL" };
+        info!("Placing {} order for {} {} at price {}", side, amount, asset, price);
+        
         let order = self
             .exchange_client
             .order(
                 ClientOrderRequest {
-                    asset,
+                    asset: asset.clone(),
                     is_buy,
                     reduce_only: false,
                     limit_px: price,
@@ -215,13 +228,15 @@ impl MarketMaker {
                         if !order.statuses.is_empty() {
                             match order.statuses[0].clone() {
                                 ExchangeDataStatus::Filled(order) => {
+                                    info!("Order filled immediately: {} {} at {}", amount, asset, price);
                                     return (amount, order.oid);
                                 }
                                 ExchangeDataStatus::Resting(order) => {
+                                    info!("Order resting: {} {} at {}", amount, asset, price);
                                     return (amount, order.oid);
                                 }
                                 ExchangeDataStatus::Error(e) => {
-                                    error!("Error with placing order: {e}")
+                                    error!("Error with placing order: {}", e)
                                 }
                                 _ => unreachable!(),
                             }
@@ -233,10 +248,10 @@ impl MarketMaker {
                     }
                 }
                 ExchangeResponseStatus::Err(e) => {
-                    error!("Error with placing order: {e}")
+                    error!("Error with placing order: {}", e)
                 }
             },
-            Err(e) => error!("Error with placing order: {e}"),
+            Err(e) => error!("Error with placing order: {}", e),
         }
         (0.0, 0)
     }
@@ -252,6 +267,9 @@ impl MarketMaker {
             truncate_float(lower_price, self.decimals, true),
             truncate_float(upper_price, self.decimals, false),
         );
+
+        info!("Current mid price: {}, Spread: {} bps", self.latest_mid_price, self.half_spread * 2);
+        info!("Target prices - Buy: {}, Sell: {}", lower_price, upper_price);
 
         // Rounding optimistically to make our market tighter might cause a weird edge case, so account for that
         if (lower_price - upper_price).abs() < EPSILON {
