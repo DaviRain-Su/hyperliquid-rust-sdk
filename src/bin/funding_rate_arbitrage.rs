@@ -3,30 +3,85 @@ use hyperliquid_rust_sdk::{
     BaseUrl, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient, InfoClient,
     ExchangeDataStatus, ExchangeResponseStatus, Message, Subscription, UserData,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
 use dotenv::dotenv;
 use std::env;
+use thiserror::Error;
+use std::future::Future;
+
+// 自定义错误类型
+#[derive(Error, Debug)]
+enum TradingError {
+    #[error("API错误: {0}")]
+    ApiError(String),
+    #[error("订单错误: {0}")]
+    OrderError(String),
+    #[error("资金费率错误: {0}")]
+    FundingRateError(String),
+    #[error("配置错误: {0}")]
+    ConfigError(String),
+    #[error("网络错误: {0}")]
+    NetworkError(String),
+    #[error("其他错误: {0}")]
+    Other(String),
+}
+
+// 重试配置
+struct RetryConfig {
+    max_retries: u32,
+    retry_delay: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            retry_delay: Duration::from_secs(1),
+        }
+    }
+}
+
+// 重试执行函数
+async fn retry_operation<F, Fut, T, E>(operation: F, config: &RetryConfig) -> Result<T, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match operation().await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            warn!("操作失败: {}，将在{}秒后重试", e, config.retry_delay.as_secs());
+            sleep(config.retry_delay).await;
+            Err(e)
+        }
+    }
+}
 
 // 从环境变量读取配置，如果不存在则使用默认值
-fn get_env_or_default<T: std::str::FromStr>(key: &str, default: T) -> T 
+fn get_env_or_default<T: std::str::FromStr>(key: &str, _default: T) -> Result<T, TradingError> 
 where 
     T::Err: std::fmt::Debug 
 {
     env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+        .ok_or_else(|| TradingError::ConfigError(format!("无法解析配置项: {}", key)))
 }
 
 // 计算资金费率套利机会
 fn calculate_funding_arbitrage(
     funding_rates: &HashMap<String, f64>,
     min_profit_percentage: f64,
-) -> Option<(String, String, f64)> {
+) -> Result<Option<(String, String, f64)>, TradingError> {
+    if funding_rates.is_empty() {
+        return Err(TradingError::FundingRateError("没有可用的资金费率数据".to_string()));
+    }
+
     let mut best_opportunity: Option<(String, String, f64)> = None;
     
     // 遍历所有交易对
@@ -56,37 +111,41 @@ fn calculate_funding_arbitrage(
         }
     }
     
-    best_opportunity
+    Ok(best_opportunity)
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), TradingError> {
     // 加载 .env 文件
     dotenv().ok();
     env_logger::init();
     
     // 从环境变量读取私钥
-    let private_key = env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set in .env file");
+    let private_key = env::var("PRIVATE_KEY")
+        .map_err(|_| TradingError::ConfigError("PRIVATE_KEY must be set in .env file".to_string()))?;
     
     // 初始化钱包
     let wallet: LocalWallet = private_key
         .parse()
-        .unwrap();
+        .map_err(|e| TradingError::ConfigError(format!("无效的私钥: {}", e)))?;
     let user_address = wallet.address();
     println!("Wallet: {:?}", user_address);
 
     // 初始化客户端
-    let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await.unwrap();
+    let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
+        .await
+        .map_err(|e| TradingError::ApiError(format!("初始化信息客户端失败: {}", e)))?;
+    
     let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None)
         .await
-        .unwrap();
+        .map_err(|e| TradingError::ApiError(format!("初始化交易客户端失败: {}", e)))?;
 
     // 从环境变量读取交易参数
-    let min_profit_percentage = get_env_or_default("MIN_PROFIT_PERCENTAGE", 0.1); // 最小收益率 0.1%
-    let max_trade_amount = get_env_or_default("MAX_TRADE_AMOUNT", 1000.0); // 最大交易金额
-    let check_interval = get_env_or_default("CHECK_INTERVAL", 60); // 检查间隔（秒）
-    let leverage = get_env_or_default("LEVERAGE", 1) as u32;
-    let funding_interval = get_env_or_default("FUNDING_INTERVAL", 8 * 60 * 60); // 资金费率结算间隔（秒）
+    let min_profit_percentage = get_env_or_default("MIN_PROFIT_PERCENTAGE", 0.1)?;
+    let max_trade_amount = get_env_or_default("MAX_TRADE_AMOUNT", 1000.0)?;
+    let check_interval = get_env_or_default("CHECK_INTERVAL", 60)?;
+    let leverage = get_env_or_default("LEVERAGE", 1)? as u32;
+    let funding_interval = get_env_or_default("FUNDING_INTERVAL", 8 * 60 * 60)?;
     
     info!("=== 交易参数 ===");
     info!("最小收益率: {}%", min_profit_percentage);
@@ -109,12 +168,14 @@ async fn main() {
     info_client
         .subscribe(Subscription::AllMids, sender.clone())
         .await
-        .unwrap();
+        .map_err(|e| TradingError::ApiError(format!("订阅价格更新失败: {}", e)))?;
     
     info_client
         .subscribe(Subscription::UserEvents { user: user_address }, sender.clone())
         .await
-        .unwrap();
+        .map_err(|e| TradingError::ApiError(format!("订阅用户事件失败: {}", e)))?;
+
+    let retry_config = RetryConfig::default();
 
     loop {
         info!("=== 开始新一轮检查 ===");
@@ -157,97 +218,136 @@ async fn main() {
                 for (asset, price) in all_mids {
                     if let Ok(rate) = price.parse::<f64>() {
                         funding_rates.insert(asset, rate);
+                    } else {
+                        warn!("无法解析资金费率: {}", price);
                     }
                 }
 
                 // 检查套利机会
-                if let Some((asset1, asset2, profit_percentage)) = calculate_funding_arbitrage(
-                    &funding_rates,
-                    min_profit_percentage,
-                ) {
-                    info!("发现资金费率套利机会！");
-                    info!("交易对: {} - {}", asset1, asset2);
-                    info!("预期收益率: {:.2}%", profit_percentage);
+                match calculate_funding_arbitrage(&funding_rates, min_profit_percentage) {
+                    Ok(Some((asset1, asset2, profit_percentage))) => {
+                        info!("发现资金费率套利机会！");
+                        info!("交易对: {} - {}", asset1, asset2);
+                        info!("预期收益率: {:.2}%", profit_percentage);
 
-                    // 获取资金费率
-                    let rate1 = funding_rates.get(&asset1).unwrap();
-                    let rate2 = funding_rates.get(&asset2).unwrap();
+                        // 获取资金费率
+                        let rate1 = funding_rates.get(&asset1)
+                            .ok_or_else(|| TradingError::FundingRateError(format!("找不到资产 {} 的资金费率", asset1)))?;
+                        let rate2 = funding_rates.get(&asset2)
+                            .ok_or_else(|| TradingError::FundingRateError(format!("找不到资产 {} 的资金费率", asset2)))?;
 
-                    // 确定交易方向
-                    let (long_asset, short_asset) = if rate1 > rate2 {
-                        (asset2, asset1)
-                    } else {
-                        (asset1, asset2)
-                    };
+                        // 确定交易方向
+                        let (long_asset, short_asset) = if rate1 > rate2 {
+                            (asset2, asset1)
+                        } else {
+                            (asset1, asset2)
+                        };
 
-                    // 设置杠杆倍数
-                    for asset in [&long_asset, &short_asset] {
-                        match exchange_client.update_leverage(leverage, asset, false, None).await {
-                            Ok(_) => info!("成功设置{}杠杆倍数为 {}x", asset, leverage),
+                        // 设置杠杆倍数
+                        for asset in [&long_asset, &short_asset] {
+                            match retry_operation(
+                                || async {
+                                    exchange_client.update_leverage(leverage, asset, false, None).await
+                                        .map_err(|e| TradingError::OrderError(format!("设置杠杆倍数失败: {}", e)))
+                                },
+                                &retry_config
+                            ).await {
+                                Ok(_) => info!("成功设置{}杠杆倍数为 {}x", asset, leverage),
+                                Err(e) => {
+                                    error!("设置{}杠杆倍数失败: {}", asset, e);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // 开仓
+                        let position_size = max_trade_amount / 2.0; // 平均分配资金
+
+                        // 做多
+                        let long_order = ClientOrderRequest {
+                            asset: long_asset.clone(),
+                            is_buy: true,
+                            reduce_only: false,
+                            limit_px: 0.0,
+                            sz: position_size,
+                            cloid: None,
+                            order_type: ClientOrder::Limit(ClientLimit {
+                                tif: "Gtc".to_string(),
+                            }),
+                        };
+
+                        match retry_operation(
+                            || async {
+                                exchange_client.order(long_order, None).await
+                                    .map_err(|e| TradingError::OrderError(format!("做多订单失败: {}", e)))
+                            },
+                            &retry_config
+                        ).await {
+                            Ok(ExchangeResponseStatus::Ok(response)) => {
+                                if let Some(data) = response.data {
+                                    if !data.statuses.is_empty() {
+                                        if let ExchangeDataStatus::Resting(_order) = &data.statuses[0] {
+                                            info!("做多订单已提交: {} {}", position_size, long_asset);
+                                            active_positions.insert(long_asset.clone(), (position_size, true));
+                                        }
+                                    }
+                                }
+                            },
+                            Ok(ExchangeResponseStatus::Err(e)) => {
+                                error!("做多订单失败: {:?}", e);
+                                continue;
+                            },
                             Err(e) => {
-                                error!("设置{}杠杆倍数失败: {:?}", asset, e);
+                                error!("做多订单失败: {}", e);
                                 continue;
                             }
                         }
-                    }
 
-                    // 开仓
-                    let position_size = max_trade_amount / 2.0; // 平均分配资金
+                        // 做空
+                        let short_order = ClientOrderRequest {
+                            asset: short_asset.clone(),
+                            is_buy: false,
+                            reduce_only: false,
+                            limit_px: 0.0,
+                            sz: position_size,
+                            cloid: None,
+                            order_type: ClientOrder::Limit(ClientLimit {
+                                tif: "Gtc".to_string(),
+                            }),
+                        };
 
-                    // 做多
-                    let long_order = ClientOrderRequest {
-                        asset: long_asset.clone(),
-                        is_buy: true,
-                        reduce_only: false,
-                        limit_px: 0.0, // 市价单
-                        sz: position_size,
-                        cloid: None,
-                        order_type: ClientOrder::Limit(ClientLimit {
-                            tif: "Gtc".to_string(),
-                        }),
-                    };
-
-                    match exchange_client.order(long_order, None).await {
-                        Ok(ExchangeResponseStatus::Ok(response)) => {
-                            if let Some(data) = response.data {
-                                if !data.statuses.is_empty() {
-                                    if let ExchangeDataStatus::Resting(_order) = &data.statuses[0] {
-                                        info!("做多订单已提交: {} {}", position_size, long_asset);
-                                        active_positions.insert(long_asset.clone(), (position_size, true));
+                        match retry_operation(
+                            || async {
+                                exchange_client.order(short_order, None).await
+                                    .map_err(|e| TradingError::OrderError(format!("做空订单失败: {}", e)))
+                            },
+                            &retry_config
+                        ).await {
+                            Ok(ExchangeResponseStatus::Ok(response)) => {
+                                if let Some(data) = response.data {
+                                    if !data.statuses.is_empty() {
+                                        if let ExchangeDataStatus::Resting(_order) = &data.statuses[0] {
+                                            info!("做空订单已提交: {} {}", position_size, short_asset);
+                                            active_positions.insert(short_asset.clone(), (position_size, false));
+                                        }
                                     }
                                 }
+                            },
+                            Ok(ExchangeResponseStatus::Err(e)) => {
+                                error!("做空订单失败: {:?}", e);
+                                continue;
+                            },
+                            Err(e) => {
+                                error!("做空订单失败: {}", e);
+                                continue;
                             }
-                        },
-                        Ok(ExchangeResponseStatus::Err(e)) => error!("做多订单失败: {:?}", e),
-                        Err(e) => error!("做多订单失败: {:?}", e),
-                    }
-
-                    // 做空
-                    let short_order = ClientOrderRequest {
-                        asset: short_asset.clone(),
-                        is_buy: false,
-                        reduce_only: false,
-                        limit_px: 0.0, // 市价单
-                        sz: position_size,
-                        cloid: None,
-                        order_type: ClientOrder::Limit(ClientLimit {
-                            tif: "Gtc".to_string(),
-                        }),
-                    };
-
-                    match exchange_client.order(short_order, None).await {
-                        Ok(ExchangeResponseStatus::Ok(response)) => {
-                            if let Some(data) = response.data {
-                                if !data.statuses.is_empty() {
-                                    if let ExchangeDataStatus::Resting(_order) = &data.statuses[0] {
-                                        info!("做空订单已提交: {} {}", position_size, short_asset);
-                                        active_positions.insert(short_asset.clone(), (position_size, false));
-                                    }
-                                }
-                            }
-                        },
-                        Ok(ExchangeResponseStatus::Err(e)) => error!("做空订单失败: {:?}", e),
-                        Err(e) => error!("做空订单失败: {:?}", e),
+                        }
+                    },
+                    Ok(None) => {
+                        info!("当前没有合适的套利机会");
+                    },
+                    Err(e) => {
+                        error!("计算套利机会时出错: {}", e);
                     }
                 }
             },
@@ -291,4 +391,6 @@ async fn main() {
         info!("\n等待{}秒后进行下一次检查...", check_interval);
         sleep(Duration::from_secs(check_interval)).await;
     }
+
+    Ok(())
 } 
