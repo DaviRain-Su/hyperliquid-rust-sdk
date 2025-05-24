@@ -13,7 +13,7 @@ use tokio::{
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    let mut info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
+    let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await.unwrap();
     let user = H160::from_str("0xc64cc00b46101bd40aa1c3121195e85c0b0918d8").unwrap();
 
     let (sender, mut receiver) = unbounded_channel();

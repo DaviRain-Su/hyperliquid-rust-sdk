@@ -2,12 +2,12 @@ use ethers::types::H160;
 use hyperliquid_rust_sdk::{BaseUrl, InfoClient};
 use log::info;
 
-const ADDRESS: &str = "0xc64cc00b46101bd40aa1c3121195e85c0b0918d8";
+const ADDRESS: &str = "0x0C219488E878b66d9e098ED59Ab714c5c29eB0dF";
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    let info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
+    let info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await.unwrap();
     open_orders_example(&info_client).await;
     user_state_example(&info_client).await;
     user_states_example(&info_client).await;
