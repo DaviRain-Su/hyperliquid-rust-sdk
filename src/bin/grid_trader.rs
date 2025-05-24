@@ -65,7 +65,7 @@ async fn main() {
         .unwrap();
 
     // 交易参数设置
-    let asset = "ETH".to_string();
+    let asset = "FARTCOIN".to_string();
     let grid_count = 3;   // 网格数量
     let trade_amount = 100.0; // 每个网格的交易金额
     let max_position = 300.0; // 最大持仓量
